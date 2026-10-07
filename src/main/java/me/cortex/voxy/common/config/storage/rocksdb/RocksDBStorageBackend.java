@@ -82,7 +82,8 @@ public class RocksDBStorageBackend extends StorageBackend {
         final DBOptions options = new DBOptions()
                 //.setUnorderedWrite(true)
                 .setAvoidUnnecessaryBlockingIO(true)
-                .setIncreaseParallelism(2)
+                //Enough background flush/compaction threads that large writes (e.g. world imports) dont stall on compaction
+                .setIncreaseParallelism(Math.clamp(Runtime.getRuntime().availableProcessors()/4, 2, 6))
                 .setCreateIfMissing(true)
                 .setCreateMissingColumnFamilies(true)
                 .setMaxTotalWalSize(1024*1024*128);//128 mb max WAL size

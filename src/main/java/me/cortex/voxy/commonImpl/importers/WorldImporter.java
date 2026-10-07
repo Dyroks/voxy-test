@@ -387,7 +387,11 @@ public class WorldImporter implements IDataImporter {
             Logger.warn("Header of region file invalid");
             return;
         }
-        for (int idx = 0; idx < 1024; idx++) {
+        //Visit the chunks in morton (z-order) order, so the chunks that share a lod section (2x2 chunks for level 0,
+        // 4x4 for level 1...) are queued next to each other. Each section is then completed in a short time window,
+        // which avoids saving the same section multiple times and keeps the section caches hot
+        for (int morton = 0; morton < 1024; morton++) {
+            int idx = Integer.compress(morton, 0b01_0101_0101) | (Integer.compress(morton, 0b10_1010_1010)<<5);
             int sectorMeta = Integer.reverseBytes(MemoryUtil.memGetInt(regionFile.address+idx*4));//Assumes little endian
             if (sectorMeta == 0) {
                 //Empty chunk

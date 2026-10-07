@@ -67,6 +67,13 @@ public class VoxyConfigMenu implements ConfigEntryPoint {
                                         ()->CFG.serviceThreads, v->CFG.serviceThreads=v,
                                         new Range(1, CpuLayout.getCoreCount(), 1))
                                         .setPostChangeFlags("voxy:update_threads"),
+                                new IntOption(
+                                        "voxy:import_thread_count",
+                                        Component.translatable("voxy.config.general.importThreads"),
+                                        ()->CFG.importThreads, v->CFG.importThreads=v,
+                                        new Range(0, Runtime.getRuntime().availableProcessors(), 1))
+                                        .setFormatter(v->v==0?Component.translatable("voxy.config.general.importThreads.auto", VoxyConfig.getAutoImportThreadCount()):Component.literal(Integer.toString(v)))
+                                        .setPostChangeFlags("voxy:update_threads"),
                                 new BoolOption(
                                         "voxy:use_sodium_threads",
                                         Component.translatable("voxy.config.general.useSodiumBuilder"),

@@ -2,6 +2,7 @@ package me.cortex.voxy.client;
 
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.commonImpl.ImportManager;
+import me.cortex.voxy.commonImpl.VoxyCommon;
 import me.cortex.voxy.commonImpl.importers.IDataImporter;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.components.LerpingBossEvent;
@@ -15,6 +16,7 @@ public class ClientImportManager extends ImportManager {
     protected class ClientImportTask extends ImportTask {
         private final UUID bossbarUUID;
         private final LerpingBossEvent bossBar;
+        private volatile VoxyClientInstance boostedInstance;
         protected ClientImportTask(IDataImporter importer) {
             super(importer);
 
@@ -23,6 +25,15 @@ public class ClientImportManager extends ImportManager {
             Minecraft.getInstance().execute(()->{
                 Minecraft.getInstance().gui.hud.getBossOverlay().events.put(bossBar.getId(), bossBar);
             });
+        }
+
+        @Override
+        protected void onStarted() {
+            //Use more threads while the import is running
+            if (VoxyCommon.getInstance() instanceof VoxyClientInstance instance) {
+                this.boostedInstance = instance;
+                instance.setImportActive(true);
+            }
         }
 
         @Override
@@ -51,6 +62,11 @@ public class ClientImportManager extends ImportManager {
         @Override
         protected void onCompleted(int total) {
             super.onCompleted(total);
+            var instance = this.boostedInstance;
+            this.boostedInstance = null;
+            if (instance != null && instance.isRunning()) {//If the instance is shutting down the pool is being destroyed anyway
+                instance.setImportActive(false);
+            }
             Minecraft.getInstance().execute(()->{
                 Minecraft.getInstance().gui.hud.getBossOverlay().events.remove(this.bossbarUUID);
                 long delta = Math.max(System.currentTimeMillis() - this.startTime, 1);

@@ -10,6 +10,10 @@
   "voxy.config.general.serviceThreads": "Service threads",
   "voxy.config.general.serviceThreads.tooltip": "Number of threads the ServiceThreadPool can use",
 
+  "voxy.config.general.importThreads": "Import threads",
+  "voxy.config.general.importThreads.tooltip": "Number of threads used while a /voxy import is running (never less than the service threads). Auto uses all logical cores but 2, the game may be less smooth during an import",
+  "voxy.config.general.importThreads.auto": "Auto (%s)",
+
   "voxy.config.general.useSodiumBuilder": "Use sodium threads",
   "voxy.config.general.useSodiumBuilder.tooltip": "Uses sodium builder threads as part of voxys thread pool, can reduce stuttering and lag when moving quickly at high render distance",
 

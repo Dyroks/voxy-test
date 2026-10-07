@@ -17,11 +17,13 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.world.level.storage.LevelResource;
 
 import java.nio.file.Path;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class VoxyClientInstance extends VoxyInstance {
     private final Config config;
     private final Path basePath;
     private final boolean noIngestOverride;
+    private final AtomicInteger activeImports = new AtomicInteger();
 
     public VoxyClientInstance() {
         {
@@ -42,9 +44,22 @@ public class VoxyClientInstance extends VoxyInstance {
         return !this.config.disabled;
     }
 
+    //While an import is running the thread pool is grown to the import thread count, then restored
+    public void setImportActive(boolean active) {
+        if (active) {
+            this.activeImports.incrementAndGet();
+        } else {
+            this.activeImports.decrementAndGet();
+        }
+        this.updateDedicatedThreads();
+    }
+
     @Override
-    public void updateDedicatedThreads() {
+    public synchronized void updateDedicatedThreads() {
         int target = VoxyConfig.CONFIG.serviceThreads;
+        if (this.activeImports.get() > 0) {
+            target = VoxyConfig.CONFIG.getImportThreadCount();
+        }
         if (!VoxyConfig.CONFIG.dontUseSodiumBuilderThreads) {
             var swr = SodiumWorldRenderer.instanceNullable();
             if (swr != null) {

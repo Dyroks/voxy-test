@@ -32,6 +32,7 @@ public class VoxyConfig {
     public boolean ingestEnabled = true;
     public float sectionRenderDistance = 16;
     public int serviceThreads = (int) Math.max(CpuLayout.getCoreCount()/1.5, 1);
+    public int importThreads = 0;//Threads used while a world import is running, 0 means automatic
     public float subDivisionSize = 64;
     public String fogMode;
     public boolean dontUseSodiumBuilderThreads = false;
@@ -112,6 +113,17 @@ public class VoxyConfig {
         return FabricLoader.getInstance()
                 .getConfigDir()
                 .resolve("voxy-config.json");
+    }
+
+    public static int getAutoImportThreadCount() {
+        //Leave a couple of logical cores for the render and server threads
+        return Math.max(1, Runtime.getRuntime().availableProcessors() - 2);
+    }
+
+    //Number of service threads to use while an import is running, never less than the normal service thread count
+    public int getImportThreadCount() {
+        int threads = this.importThreads > 0 ? this.importThreads : getAutoImportThreadCount();
+        return Math.max(this.serviceThreads, threads);
     }
 
     public boolean isRenderingEnabled() {

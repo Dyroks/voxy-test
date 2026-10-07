@@ -32,7 +32,12 @@ public class ImportManager {
                 throw new IllegalStateException();
             }
             this.startTime = System.currentTimeMillis();
+            this.onStarted();
             this.importer.runImport(this::onUpdate, this::onCompleted);
+        }
+
+        protected void onStarted() {
+
         }
 
         protected boolean onUpdate(int completed, int outOf) {

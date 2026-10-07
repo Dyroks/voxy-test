@@ -146,7 +146,7 @@ public class VoxyCommands {
         var engine = WorldIdentifier.ofEngine(Minecraft.getInstance().level);
         if (engine==null) return false;
         return instance.getImportManager().makeAndRunIfNone(engine, ()->{
-            var importer = new WorldImporter(engine, Minecraft.getInstance().level, instance.getServiceManager(), instance.savingServiceRateLimiter);
+            var importer = new WorldImporter(engine, Minecraft.getInstance().level, instance.getServiceManager(), instance.savingServiceRateLimiter, instance::getPendingSaveCount);
             importer.importRegionDirectoryAsync(directory);
             return importer;
         });
@@ -296,7 +296,7 @@ public class VoxyCommands {
         var engine = WorldIdentifier.ofEngine(Minecraft.getInstance().level);
         if (engine != null) {
             return instance.getImportManager().makeAndRunIfNone(engine, () -> {
-                var importer = new WorldImporter(engine, Minecraft.getInstance().level, instance.getServiceManager(), instance.savingServiceRateLimiter);
+                var importer = new WorldImporter(engine, Minecraft.getInstance().level, instance.getServiceManager(), instance.savingServiceRateLimiter, instance::getPendingSaveCount);
                 importer.importZippedRegionDirectoryAsync(zip, finalInnerDir);
                 return importer;
             }) ? 0 : 1;

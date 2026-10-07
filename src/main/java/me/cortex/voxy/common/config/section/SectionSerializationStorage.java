@@ -12,6 +12,7 @@ import me.cortex.voxy.common.world.other.Mapper;
 
 import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.List;
 import java.util.function.LongConsumer;
 
 public class SectionSerializationStorage extends SectionStorage {
@@ -75,6 +76,13 @@ public class SectionSerializationStorage extends SectionStorage {
     @Override
     public void iteratePositions(int level, LongConsumer consumer) {
         this.backend.iteratePositions(level, consumer);
+    }
+
+    @Override
+    public void addStatistics(List<String> out) {
+        for (var backend : this.backend.collectAllBackends()) {
+            backend.addStatistics(out);
+        }
     }
 
     public static class Config extends SectionStorageConfig {

@@ -8,6 +8,7 @@ import net.minecraft.client.gui.components.LerpingBossEvent;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.BossEvent;
 
+import java.util.Locale;
 import java.util.UUID;
 
 public class ClientImportManager extends ImportManager {
@@ -29,9 +30,20 @@ public class ClientImportManager extends ImportManager {
             if (!super.onUpdate(completed, outOf)) {
                 return false;
             }
+            String text = "Voxy import: " + completed + "/" + outOf + " chunks";
+            long elapsed = System.currentTimeMillis() - this.startTime;
+            if (completed > 0 && elapsed > 0) {
+                double rate = completed * 1000.0 / elapsed;
+                text += " (" + (long) rate + "/s";
+                if (outOf > completed) {
+                    text += ", ETA " + formatDuration((long) ((outOf - completed) / rate));
+                }
+                text += ")";
+            }
+            String name = text;
             Minecraft.getInstance().execute(()->{
                 this.bossBar.setProgress((float) (((double)completed) / ((double) Math.max(1, outOf))));
-                this.bossBar.setName(Component.nullToEmpty("Voxy import: " + completed + "/" + outOf + " chunks"));
+                this.bossBar.setName(Component.nullToEmpty(name));
             });
             return true;
         }
@@ -44,6 +56,10 @@ public class ClientImportManager extends ImportManager {
                 long delta = Math.max(System.currentTimeMillis() - this.startTime, 1);
 
                 String msg = "Voxy world import finished in " + (delta/1000) + " seconds, averaging " + (int)(total/(delta/1000f)) + " chunks per second";
+                String details = this.importer.getCompletionDetails();
+                if (details != null) {
+                    msg += ", " + details;
+                }
                 Minecraft.getInstance().gui.hud.getChat().addClientSystemMessage(Component.literal(msg));
                 Logger.info(msg);
             });
@@ -53,5 +69,15 @@ public class ClientImportManager extends ImportManager {
     @Override
     protected synchronized ImportTask createImportTask(IDataImporter importer) {
         return new ClientImportTask(importer);
+    }
+
+    private static String formatDuration(long seconds) {
+        if (seconds >= 3600) {
+            return (seconds/3600) + "h" + String.format(Locale.ROOT, "%02d", (seconds%3600)/60) + "m";
+        }
+        if (seconds >= 60) {
+            return (seconds/60) + "m" + String.format(Locale.ROOT, "%02d", seconds%60) + "s";
+        }
+        return seconds + "s";
     }
 }

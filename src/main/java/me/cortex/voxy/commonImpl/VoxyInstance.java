@@ -91,6 +91,9 @@ public abstract class VoxyInstance {
     public ImportManager getImportManager() {
         return this.importManager;
     }
+    public int getPendingSaveCount() {
+        return this.savingService.getTaskCount();
+    }
 
     //TODO: reference count the world object
     // have automatic world cleanup after ~1 minute of inactivity and the reference count equaling zero possibly

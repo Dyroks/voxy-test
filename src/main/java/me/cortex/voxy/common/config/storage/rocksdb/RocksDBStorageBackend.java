@@ -223,6 +223,19 @@ public class RocksDBStorageBackend extends StorageBackend {
     }
 
     @Override
+    public void addStatistics(List<String> out) {
+        try {
+            long l0Files = this.db.getLongProperty(this.worldSections, "rocksdb.num-files-at-level0");
+            long pendingCompaction = this.db.getLongProperty(this.worldSections, "rocksdb.estimate-pending-compaction-bytes");
+            long delayedWriteRate = this.db.getLongProperty("rocksdb.actual-delayed-write-rate");
+            long writeStopped = this.db.getLongProperty("rocksdb.is-write-stopped");
+            out.add("rocksdb L0 files: " + l0Files + ", pending compaction: " + (pendingCompaction>>20) + "MB, delayed write rate: " + delayedWriteRate + ", write stopped: " + writeStopped);
+        } catch (RocksDBException e) {
+            out.add("rocksdb stats unavailable: " + e.getMessage());
+        }
+    }
+
+    @Override
     public void close() {
         this.flush();
         //this.db.cancelAllBackgroundWork(true);//Rocksdb does this automatically (afak)

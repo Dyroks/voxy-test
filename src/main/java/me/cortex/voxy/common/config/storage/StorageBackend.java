@@ -24,6 +24,10 @@ public abstract class StorageBackend implements IMappingStorage, IStoredSectionP
         return List.of();
     }
 
+    //Appends human readable runtime statistics (if the backend has any) to the list, used for diagnostics
+    public void addStatistics(List<String> out) {
+    }
+
     public final List<StorageBackend> collectAllBackends() {
         List<StorageBackend> backends = new ArrayList<>();
         backends.add(this);

@@ -12,4 +12,9 @@ public interface IDataImporter {
 
     void shutdown();
     boolean isRunning();
+
+    //Optional extra information appended to the completion message (e.g. skipped or failed entries), null if none
+    default String getCompletionDetails() {
+        return null;
+    }
 }

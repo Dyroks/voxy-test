@@ -7,12 +7,17 @@ import me.cortex.voxy.common.world.WorldEngine;
 import me.cortex.voxy.common.world.WorldSection;
 
 import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.atomic.LongAdder;
 
 //TODO: add an option for having synced saving, that is when call enqueueSave, that will instead, instantly
 // save to the db, this can be useful for just reducing the amount of thread pools in total
 // might have some issues with threading if the same section is saved from multiple threads?
 public class SectionSavingService {
     private static final int SOFT_MAX_QUEUE_SIZE = 5_000;
+
+    //Global save statistics (count and time spent serializing, compressing and writing), used for diagnostics
+    private static final LongAdder SAVE_COUNT = new LongAdder();
+    private static final LongAdder SAVE_NANOS = new LongAdder();
 
     private final Service service;
     private record SaveEntry(WorldEngine engine, WorldSection section) {}
@@ -30,7 +35,10 @@ public class SectionSavingService {
             //Unmark it dirty here (if it wasnt or w/e) so that it doesnt pointlessly resave (in theory this should be safe to do)
             if (section.exchangeIsInSaveQueue(false)) {
                 section.setNotDirty();//do after the atomic exchange
+                long start = System.nanoTime();
                 task.engine.storage.saveSection(section);
+                SAVE_NANOS.add(System.nanoTime() - start);
+                SAVE_COUNT.increment();
             } else {
                 section.setNotDirty();
             }
@@ -96,5 +104,13 @@ public class SectionSavingService {
 
     public int getTaskCount() {
         return this.service.numJobs();
+    }
+
+    public static long getTotalSaveCount() {
+        return SAVE_COUNT.sum();
+    }
+
+    public static long getTotalSaveNanos() {
+        return SAVE_NANOS.sum();
     }
 }

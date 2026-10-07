@@ -1,5 +1,9 @@
 package me.cortex.voxy.client.mixin.minecraft;
 
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+import it.unimi.dsi.fastutil.longs.LongSet;
+import it.unimi.dsi.fastutil.longs.LongSets;
+import me.cortex.voxy.client.IVoxyIngestTracker;
 import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.common.world.service.VoxelIngestService;
 import me.cortex.voxy.commonImpl.VoxyCommon;
@@ -12,6 +16,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Holder;
 import net.minecraft.core.SectionPos;
 import net.minecraft.resources.ResourceKey;
+import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.LightLayer;
 import net.minecraft.world.level.block.state.BlockState;
@@ -25,10 +30,29 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(ClientLevel.class)
-public abstract class MixinClientLevel {
+public abstract class MixinClientLevel implements IVoxyIngestTracker {
 
     @Unique
     private int bottomSectionY;
+
+    //Loaded chunks that were ingested and not modified since
+    @Unique
+    private LongSet voxy$unchangedIngestedChunks = LongSets.synchronize(new LongOpenHashSet());
+
+    @Override
+    public void voxy$markChunkIngested(int x, int z) {
+        this.voxy$unchangedIngestedChunks.add(ChunkPos.pack(x, z));
+    }
+
+    @Override
+    public void voxy$markChunkModified(int x, int z) {
+        this.voxy$unchangedIngestedChunks.remove(ChunkPos.pack(x, z));
+    }
+
+    @Override
+    public boolean voxy$consumeChunkUnchanged(int x, int z) {
+        return this.voxy$unchangedIngestedChunks.remove(ChunkPos.pack(x, z));
+    }
 
     @Shadow public abstract ClientChunkCache getChunkSource();
 
@@ -51,6 +75,8 @@ public abstract class MixinClientLevel {
     @Inject(method = "setBlocksDirty", at = @At("TAIL"))
     private void voxy$injectIngestOnStateChange(BlockPos pos, BlockState old, BlockState updated, CallbackInfo cir) {
         if (old == updated) return;
+        //Any change means the chunk must be ingested again when it is unloaded
+        this.voxy$markChunkModified(pos.getX()>>4, pos.getZ()>>4);
 
         //TODO: is this _really_ needed, we should have enough processing power to not need todo it if its only a
         // block removal

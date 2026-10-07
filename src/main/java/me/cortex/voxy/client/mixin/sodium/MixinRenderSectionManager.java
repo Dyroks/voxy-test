@@ -1,6 +1,7 @@
 package me.cortex.voxy.client.mixin.sodium;
 
 import me.cortex.voxy.client.ICheekyClientChunkCache;
+import me.cortex.voxy.client.IVoxyIngestTracker;
 import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
 import me.cortex.voxy.client.core.VoxyRenderSystem;
@@ -58,8 +59,15 @@ public class MixinRenderSectionManager {
 
     @Inject(method = "onChunkRemoved", at = @At("HEAD"))
     private void voxy$injectIngest(int x, int z, CallbackInfo ci) {
+        //Chunks that were not modified since they were ingested when added do not need to be ingested again
+        // (always consumed so the tracker only holds loaded chunks)
+        boolean unchanged = this.level instanceof IVoxyIngestTracker tracker && tracker.voxy$consumeChunkUnchanged(x, z);
         //TODO: Am not quite sure if this is right
         if (VoxyConfig.CONFIG.ingestEnabled && !BOBBY_INSTALLED) {
+            if (unchanged) {
+                VoxelIngestService.noteSkippedReingest();
+                return;
+            }
             var cccm = (ICheekyClientChunkCache)this.level.getChunkSource();
             if (cccm != null) {
                 var chunk = cccm.voxy$cheekyGetChunk(x, z);
@@ -77,8 +85,8 @@ public class MixinRenderSectionManager {
             var cccm = this.level.getChunkSource();
             if (cccm != null) {
                 var chunk = cccm.getChunk(x, z, ChunkStatus.FULL, false);
-                if (chunk != null) {
-                    VoxelIngestService.tryAutoIngestChunk(chunk);
+                if (chunk != null && VoxelIngestService.tryAutoIngestChunk(chunk) && this.level instanceof IVoxyIngestTracker tracker) {
+                    tracker.voxy$markChunkIngested(x, z);
                 }
             }
         }

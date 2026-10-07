@@ -10,6 +10,7 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.StampedLock;
 
 public final class ActiveSectionTracker {
@@ -33,6 +34,10 @@ public final class ActiveSectionTracker {
         public volatile int postAcquireCount;
         public volatile T obj;
     }
+
+    //Sections loaded from storage (cache misses), for statistics
+    private static final LongAdder LOAD_COUNT = new LongAdder();
+    private static final LongAdder LOAD_NANOS = new LongAdder();
 
     private final AtomicInteger loadedSections = new AtomicInteger();
     private final Long2ObjectOpenHashMap<VolatileHolder<WorldSection>>[] loadedSectionCache;
@@ -144,7 +149,10 @@ public final class ActiveSectionTracker {
                         WorldEngine.getZ(key),
                         this);
 
+                long loadStart = System.nanoTime();
                 status = this.loader.load(section);
+                LOAD_NANOS.add(System.nanoTime() - loadStart);
+                LOAD_COUNT.increment();
 
                 if (status < 0) {
                     //TODO: Instead if throwing an exception do something better, like attempting to regen
@@ -324,6 +332,14 @@ public final class ActiveSectionTracker {
         if (sec != null) {
             this.loadedSections.decrementAndGet();
         }
+    }
+
+    public static long getTotalLoadCount() {
+        return LOAD_COUNT.sum();
+    }
+
+    public static long getTotalLoadNanos() {
+        return LOAD_NANOS.sum();
     }
 
     private int getCacheArrayIndex(long pos) {

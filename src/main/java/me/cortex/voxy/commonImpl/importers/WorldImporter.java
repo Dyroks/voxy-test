@@ -96,6 +96,7 @@ public class WorldImporter implements IDataImporter {
     private final LongAdder fastSections = new LongAdder();
     private final LongAdder vanillaSections = new LongAdder();
     private final LongAdder sectionsWithBlocks = new LongAdder();
+    private final LongAdder sectionsSkyFromAbove = new LongAdder();
     private final AtomicInteger verifyMismatches = new AtomicInteger();
     private long statsStartTime;
     private long lastStatsTime;
@@ -753,18 +754,35 @@ public class WorldImporter implements IDataImporter {
                 }
             }
 
+            var sectionList = chunk.getList("sections").orElseThrow();
+            var sections = new CompoundTag[sectionList.size()];
+            int sectionCount = 0;
             boolean hasLight = false;
-            for (var sectionE : chunk.getList("sections").orElseThrow()) {
+            for (var sectionE : sectionList) {
                 var section = (CompoundTag) sectionE;
                 hasLight |= section.contains("SkyLight") || section.contains("BlockLight");
-                int y = section.getIntOr("Y", Integer.MIN_VALUE);
-                this.importSectionNBT(x, y, z, section, upgradeFrom);
+                sections[sectionCount++] = section;
             }
-            //The game computes the light of such chunks when loading them, the importer can only use the stored light
+            //The game computes the light of chunks without stored light when loading them, the importer estimates it
             if (!hasLight) {
                 this.unlitChunks.increment();
                 if (this.loggedUnlitChunks.compareAndSet(false, true)) {
-                    Logger.warn("Some chunks have no stored light data, they are imported unlit (dark) until the game loads them");
+                    Logger.warn("Some chunks have no stored light data (the game computes it when loading them), their sky light is estimated");
+                }
+            }
+
+            //The sky light of the sections without stored sky light comes from the sections above them, so go from the top down
+            Arrays.sort(sections, 0, sectionCount, Comparator.comparingInt((CompoundTag section) -> section.getIntOr("Y", Integer.MIN_VALUE)).reversed());
+            var skyColumns = SKY_LIGHT_COLUMNS.get();
+            skyColumns.reset();
+            for (int i = 0; i < sectionCount; i++) {
+                var section = sections[i];
+                int y = section.getIntOr("Y", Integer.MIN_VALUE);
+                byte[] skyLight = hasLight ? section.getByteArray("SkyLight").filter(array -> array.length == 2048).orElse(null) : null;
+                int skyMode = !hasLight ? SKY_ESTIMATED : (skyLight != null ? SKY_STORED : SKY_FROM_ABOVE);
+                this.importSectionNBT(x, y, z, section, upgradeFrom, skyColumns, skyMode);
+                if (skyLight != null) {
+                    skyColumns.takeBottomLayer(skyLight);
                 }
             }
         } catch (Exception e) {
@@ -775,8 +793,14 @@ public class WorldImporter implements IDataImporter {
 
     private static final byte[] EMPTY = new byte[0];
     private static final ThreadLocal<VoxelizedSection> SECTION_CACHE = ThreadLocal.withInitial(VoxelizedSection::createEmpty);
+    private static final ThreadLocal<SkyLightColumns> SKY_LIGHT_COLUMNS = ThreadLocal.withInitial(SkyLightColumns::new);
+    //Where the sky light of a section comes from
+    private static final int SKY_STORED = 0;//Stored in the section
+    private static final int SKY_FROM_ABOVE = 1;//Not stored, derived from the sections above like the game does
+    private static final int SKY_ESTIMATED = 2;//The chunk has no stored light at all, estimated
+
     //upgradeFrom is the data version to upgrade the section palettes from, 0 if they are already in the current format
-    private void importSectionNBT(int x, int y, int z, CompoundTag section, int upgradeFrom) {
+    private void importSectionNBT(int x, int y, int z, CompoundTag section, int upgradeFrom, SkyLightColumns skyColumns, int skyMode) {
         if (section.getCompound("block_states").isEmpty()) {
             return;
         }
@@ -796,6 +820,13 @@ public class WorldImporter implements IDataImporter {
             this.vanillaSections.increment();
             csec = this.legacyDecodeSection(section, csec);
         }
+        //Both decoders read missing sky light as 0 (darkness), replace it with the light the game would have
+        if (csec != null && skyMode == SKY_FROM_ABOVE) {
+            skyColumns.applyFromAbove(csec.section);
+            this.sectionsSkyFromAbove.increment();
+        } else if (csec != null && skyMode == SKY_ESTIMATED) {
+            skyColumns.applyEstimated(csec.section, this::getLightDampening);
+        }
         long decoded = System.nanoTime();
         this.decodeNanos.add(decoded - start);
         if (csec == null) {
@@ -808,6 +839,37 @@ public class WorldImporter implements IDataImporter {
         WorldVoxilizedSectionMipper.mipSection(csec, this.world.getMapper());
         WorldUpdater.insertUpdate(this.world, csec);
         this.insertNanos.add(System.nanoTime() - decoded);
+    }
+
+    //How much each block dims the sky light going through it (as the game computes it), indexed by block id, -1 if unknown
+    private volatile byte[] lightDampening = new byte[0];
+
+    private int getLightDampening(int blockId) {
+        if (blockId == 0) {
+            return 0;
+        }
+        var cache = this.lightDampening;
+        if (blockId < cache.length && cache[blockId] >= 0) {
+            return cache[blockId];
+        }
+        return this.computeLightDampening(blockId);
+    }
+
+    private synchronized int computeLightDampening(int blockId) {
+        var cache = this.lightDampening;
+        if (blockId >= cache.length) {
+            int size = Math.max(blockId + 1, cache.length * 2);
+            var grown = Arrays.copyOf(cache, size);
+            Arrays.fill(grown, cache.length, size, (byte) -1);
+            cache = grown;
+        }
+        int value = cache[blockId];
+        if (value < 0) {
+            value = Math.clamp(this.world.getMapper().getBlockStateFromBlockId(blockId).getLightDampening(), 0, 15);
+            cache[blockId] = (byte) value;
+        }
+        this.lightDampening = cache;
+        return value;
     }
 
     //Decodes the section with the vanilla codecs, returns null if the section could not be decoded and should be skipped
@@ -911,7 +973,7 @@ public class WorldImporter implements IDataImporter {
                 .append(this.upgradedChunks.sum()).append(" upgraded from an older version");
         long unlit = this.unlitChunks.sum();
         if (unlit != 0) {
-            sb.append(", ").append(unlit).append(" without light data");
+            sb.append(", ").append(unlit).append(" without light data (light estimated)");
         }
         sb.append(" | cpu ms per chunk: decompress ").append(perChunkMs(this.decompressNanos.sum(), chunks))
                 .append(", nbt ").append(perChunkMs(this.nbtNanos.sum(), chunks))
@@ -924,7 +986,8 @@ public class WorldImporter implements IDataImporter {
         if (fallbackReasons != null) {
             sb.append(" (").append(fallbackReasons).append(")");
         }
-        sb.append(", ").append(this.sectionsWithBlocks.sum()).append(" containing blocks");
+        sb.append(", ").append(this.sectionsWithBlocks.sum()).append(" containing blocks, ")
+                .append(this.sectionsSkyFromAbove.sum()).append(" with sky light from the sections above");
         long partialBlockStates = this.fastDecoder.getPartialBlockStateCount();
         if (partialBlockStates != 0) {
             sb.append(", ").append(partialBlockStates).append(" block states only partially decoded (see log)");

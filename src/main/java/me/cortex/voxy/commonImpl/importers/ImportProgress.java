@@ -21,9 +21,9 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 // using the file modification time and size), so that an interrupted import can be resumed and a repeated import only
 // processes the regions that changed since
 public final class ImportProgress {
-    //v1 progress was recorded by imports that read the chunks saved before 26.3 as air, it is discarded so they get
-    // imported again
-    private static final String HEADER = "#voxy-import-progress-v2";
+    //Older progress was recorded by imports that read the chunks saved before 26.3 as air (v1) or the chunks without
+    // stored light as darkness (v2), it is discarded so they get imported again
+    private static final String HEADER = "#voxy-import-progress-v3";
     //Regions are only recorded a while after they finished importing, so their sections had the time to be saved
     private static final long COMMIT_DELAY_NANOS = 60_000_000_000L;
 

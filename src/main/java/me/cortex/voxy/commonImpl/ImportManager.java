@@ -101,6 +101,10 @@ public class ImportManager {
         }
     }
 
+    public synchronized boolean isImportRunning(WorldEngine engine) {
+        return this.activeImporters.containsKey(engine);
+    }
+
     public boolean cancelImport(WorldEngine engine) {
         ImportTask task;
         synchronized (this) {

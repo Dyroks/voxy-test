@@ -42,6 +42,8 @@ import java.nio.channels.FileChannel;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
+import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -92,6 +94,11 @@ public class WorldImporter implements IDataImporter {
     private long lastStatsProcessed;
     private long lastStatsSaves;
     private long lastStatsSaveNanos;
+
+    private static final long PROGRESS_COMMIT_INTERVAL_NANOS = 10_000_000_000L;
+    private ImportOptions options = ImportOptions.NONE;
+    private int skippedRegions;//Regions skipped since they were already imported and are unchanged
+    private long lastProgressCommit;
 
     private final ConcurrentLinkedDeque<Runnable> jobQueue = new ConcurrentLinkedDeque<>();
     private final Service service;
@@ -179,6 +186,7 @@ public class WorldImporter implements IDataImporter {
             throw new IllegalStateException();
         }
         if (this.worker == null) {//Can happen if no files
+            this.closeProgress();
             completionCallback.onCompletion(0);
             return;
         }
@@ -215,16 +223,55 @@ public class WorldImporter implements IDataImporter {
         while (!this.jobQueue.isEmpty()) {
             this.jobQueue.poll().run();
         }
+        this.closeProgress();
     }
 
-    private interface IImporterMethod <T> {
-        void importRegion(T file) throws Exception;
+    //A region file (or zip entry) to import
+    private record RegionSource<T>(T source, String name, int x, int z) {}
+    private record SelectedRegion<T>(RegionSource<T> region, long[] stamp) {}
+
+    private interface IRegionReader<T> {
+        //Reads the whole region into memory, returns null if there is nothing to import
+        MemoryBuffer read(T source) throws Exception;
+    }
+
+    private interface IRegionStamper<T> {
+        //Returns {lastModified, size} identifying the current version of the region
+        long[] stamp(T source);
+    }
+
+    //Tracks the chunks of a region that are still being imported, so the region can be recorded as imported once
+    // every one of them is done
+    private final class RegionTask {
+        private final String name;
+        private final long[] stamp;//null if the region is not tracked
+        private final AtomicInteger pending = new AtomicInteger(1);//Held by the reader until all the chunks are queued
+        private volatile boolean incomplete;
+
+        private RegionTask(String name, long[] stamp) {
+            this.name = name;
+            this.stamp = stamp;
+        }
+
+        private void release() {
+            if (this.pending.decrementAndGet() == 0 && (!this.incomplete) && this.stamp != null) {
+                var progress = WorldImporter.this.options.progress();
+                if (progress != null) {
+                    progress.markCompleted(this.name, this.stamp[0], this.stamp[1]);
+                }
+            }
+        }
     }
 
     private volatile Thread worker;
     private IUpdateCallback updateCallback;
     private ICompletionCallback completionCallback;
     public void importRegionDirectoryAsync(File directory) {
+        this.importRegionDirectoryAsync(directory, ImportOptions.NONE);
+    }
+
+    public void importRegionDirectoryAsync(File directory, ImportOptions options) {
+        this.options = options;
         var files = directory.listFiles((dir, name) -> {
             var sections = name.split("\\.");
             if (sections.length != 4 || (!sections[0].equals("r")) || (!sections[3].equals("mca"))) {
@@ -237,31 +284,40 @@ public class WorldImporter implements IDataImporter {
             return;
         }
         Arrays.sort(files, File::compareTo);
-        this.importRegionsAsync(files, this::importRegionFile);
+        var regions = new ArrayList<RegionSource<File>>();
+        for (var file : files) {
+            var region = parseRegion(file, file.getName());
+            if (region != null) {
+                regions.add(region);
+            }
+        }
+        this.importRegionsAsync(regions, WorldImporter::readRegionFile, file->new long[]{file.lastModified(), file.length()});
     }
 
     public void importZippedRegionDirectoryAsync(File zip, String innerDirectory) {
+        this.importZippedRegionDirectoryAsync(zip, innerDirectory, ImportOptions.NONE);
+    }
+
+    public void importZippedRegionDirectoryAsync(File zip, String innerDirectory, ImportOptions options) {
+        this.options = options;
         try {
             innerDirectory = innerDirectory.replace("\\\\", "\\").replace("\\", "/");
             var file = ZipFile.builder().setFile(zip).get();
-            ArrayList<ZipArchiveEntry> regions = new ArrayList<>();
+            var regions = new ArrayList<RegionSource<ZipArchiveEntry>>();
             for (var e = file.getEntries(); e.hasMoreElements();) {
                 var entry = e.nextElement();
                 if (entry.isDirectory()||!entry.getName().startsWith(innerDirectory)) {
                     continue;
                 }
                 var parts = entry.getName().split("/");
-                var name = parts[parts.length-1];
-                var sections = name.split("\\.");
-                if (sections.length != 4 || (!sections[0].equals("r")) || (!sections[3].equals("mca"))) {
-                    Logger.error("Unknown file: " + name);
-                    continue;
+                var region = parseRegion(entry, parts[parts.length-1]);
+                if (region != null) {
+                    regions.add(region);
                 }
-                regions.add(entry);
             }
-            this.importRegionsAsync(regions.toArray(ZipArchiveEntry[]::new), (entry)->{
+            this.importRegionsAsync(regions, (entry)->{
                 if (entry.getSize() == 0) {
-                    return;
+                    return null;
                 }
                 var buf = new MemoryBuffer(entry.getSize());
                 try (var channel = Channels.newChannel(file.getInputStream(entry))) {
@@ -270,43 +326,87 @@ public class WorldImporter implements IDataImporter {
                         throw new IllegalStateException("Could not read full zip entry");
                     }
                 }
-
-                var parts = entry.getName().split("/");
-                var name = parts[parts.length-1];
-                var sections = name.split("\\.");
-
-                try {
-                    this.importRegion(buf, Integer.parseInt(sections[1]), Integer.parseInt(sections[2]));
-                } catch (NumberFormatException e) {
-                    Logger.error("Invalid format for region position, x: \""+sections[1]+"\" z: \"" + sections[2] + "\" skipping region");
-                }
-                buf.free();
-            });
+                return buf;
+            }, null);//Zip entries are not tracked for resuming
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
 
     }
 
-    private <T> void importRegionsAsync(T[] regionFiles, IImporterMethod<T> importer) {
+    private static <T> RegionSource<T> parseRegion(T source, String name) {
+        var sections = name.split("\\.");
+        if (sections.length != 4 || (!sections[0].equals("r")) || (!sections[3].equals("mca"))) {
+            Logger.error("Unknown file: " + name);
+            return null;
+        }
+        try {
+            return new RegionSource<>(source, name, Integer.parseInt(sections[1]), Integer.parseInt(sections[2]));
+        } catch (NumberFormatException e) {
+            Logger.error("Invalid format for region position, x: \""+sections[1]+"\" z: \"" + sections[2] + "\" skipping region");
+            return null;
+        }
+    }
+
+    //Applies the radius and resume options and orders the regions, closest to the center first
+    private <T> List<SelectedRegion<T>> selectRegions(List<RegionSource<T>> regions, IRegionStamper<T> stamper) {
+        var options = this.options;
+        var progress = options.progress();
+        var selected = new ArrayList<SelectedRegion<T>>();
+        int outsideRadius = 0;
+        for (var region : regions) {
+            if (!options.overlapsRegion(region.x(), region.z())) {
+                outsideRadius++;
+                continue;
+            }
+            long[] stamp = (progress == null || stamper == null) ? null : stamper.stamp(region.source());
+            if (stamp != null && progress.isCompleted(region.name(), stamp[0], stamp[1])) {
+                this.skippedRegions++;
+                continue;
+            }
+            selected.add(new SelectedRegion<>(region, stamp));
+        }
+        if (options.hasCenter()) {
+            selected.sort(Comparator.comparingDouble(selection -> options.distanceSquaredToRegion(selection.region().x(), selection.region().z())));
+        }
+        Logger.info("Voxy import: " + selected.size() + " regions to import"
+                + (this.skippedRegions != 0 ? ", " + this.skippedRegions + " unchanged regions already imported are skipped" : "")
+                + (outsideRadius != 0 ? ", " + outsideRadius + " regions are outside of the radius" : ""));
+        return selected;
+    }
+
+    private <T> void importRegionsAsync(List<RegionSource<T>> regions, IRegionReader<T> reader, IRegionStamper<T> stamper) {
         this.totalChunks.set(0);
         this.estimatedTotalChunks.set(0);
         this.chunksProcessed.set(0);
         this.worker = new Thread(() -> {
-            this.statsStartTime = this.lastStatsTime = System.nanoTime();
+            this.statsStartTime = this.lastStatsTime = this.lastProgressCommit = System.nanoTime();
             this.lastStatsSaves = SectionSavingService.getTotalSaveCount();
             this.lastStatsSaveNanos = SectionSavingService.getTotalSaveNanos();
-            this.estimatedTotalChunks.addAndGet(regionFiles.length*1024);
-            for (var file : regionFiles) {
+            var selected = this.selectRegions(regions, stamper);
+            this.estimatedTotalChunks.addAndGet(selected.size()*1024);
+            for (var selection : selected) {
+                var region = selection.region();
                 this.estimatedTotalChunks.addAndGet(-1024);
+                var task = new RegionTask(region.name(), selection.stamp());
                 try {
-                    importer.importRegion(file);
+                    var data = reader.read(region.source());
+                    if (data != null) {
+                        try {
+                            this.importRegion(data, region.x(), region.z(), task);
+                        } finally {
+                            data.free();
+                        }
+                    }
                 } catch (Exception e) {
                     //A broken region must not kill the importer, the chunks already queued are still processed
-                    Logger.error("Failed to import region " + file + ", skipping it", e);
+                    task.incomplete = true;
+                    Logger.error("Failed to import region " + region.name() + ", skipping it", e);
                 }
+                task.release();//Release the reader reference now that all the chunks of the region are queued
                 while ((this.totalChunks.get()-this.chunksProcessed.get() > 10_000) && this.isRunning) {
                     this.logStatistics(false);
+                    this.commitProgress();
                     try {
                         Thread.sleep(1);
                     } catch (InterruptedException e) {
@@ -314,8 +414,10 @@ public class WorldImporter implements IDataImporter {
                     }
                 }
                 this.logStatistics(false);
+                this.commitProgress();
                 if (!this.isRunning) {
                     this.service.blockTillEmpty();
+                    this.finishProgress(false);
                     this.completionCallback.onCompletion(this.totalChunks.get());
                     this.worker = null;
                     return;
@@ -331,6 +433,7 @@ public class WorldImporter implements IDataImporter {
                 }
             }
             this.logStatistics(true);
+            this.finishProgress(this.isRunning);
             if (!this.isShutdown.getAndSet(true)) {
                 this.worker = null;
                 this.service.shutdown();
@@ -349,39 +452,29 @@ public class WorldImporter implements IDataImporter {
         return this.isRunning || (this.worker != null && this.worker.isAlive());
     }
 
-    private void importRegionFile(File file) throws IOException {
-        var name = file.getName();
-        var sections = name.split("\\.");
-        if (sections.length != 4 || (!sections[0].equals("r")) || (!sections[3].equals("mca"))) {
-            Logger.error("Unknown file: " + name);
-            throw new IllegalStateException();
-        }
-        int rx = 0;
-        int rz = 0;
-        try {
-            rx = Integer.parseInt(sections[1]);
-            rz = Integer.parseInt(sections[2]);
-        } catch (NumberFormatException e) {
-            Logger.error("Invalid format for region position, x: \""+sections[1]+"\" z: \"" + sections[2] + "\" skipping region");
-            return;
-        }
+    private static MemoryBuffer readRegionFile(File file) throws IOException {
         try (var fileStream = FileChannel.open(file.toPath(), StandardOpenOption.READ)) {
-            if (fileStream.size() == 0) {
-                return;
+            long size = fileStream.size();
+            if (size == 0) {
+                return null;
             }
-            var fileData = new MemoryBuffer(fileStream.size());
-            if (fileStream.read(fileData.asByteBuffer(), 0) < 8192) {
+            var fileData = new MemoryBuffer(size);
+            var buffer = fileData.asByteBuffer();
+            while (buffer.hasRemaining() && fileStream.read(buffer, buffer.position()) > 0);
+            if (buffer.position() < 8192) {
                 fileData.free();
                 Logger.warn("Header of region file invalid");
-                return;
+                return null;
             }
-            this.importRegion(fileData, rx, rz);
-            fileData.free();
+            if (buffer.position() != size) {//File shrunk while reading
+                fileData = fileData.subSize(buffer.position());
+            }
+            return fileData;
         }
     }
 
 
-    private void importRegion(MemoryBuffer regionFile, int x, int z) {
+    private void importRegion(MemoryBuffer regionFile, int x, int z, RegionTask task) {
         //Find and load all saved chunks
         if (regionFile.size < 8192) {//File not big enough
             Logger.warn("Header of region file invalid");
@@ -401,6 +494,11 @@ public class WorldImporter implements IDataImporter {
             int sectorCount = sectorMeta&((1<<8)-1);
 
             if (sectorCount == 0) {
+                continue;
+            }
+
+            if (!this.options.includesChunk((x<<5)|(idx&31), (z<<5)|(idx>>5))) {
+                task.incomplete = true;//Only part of the region is imported, so it must not be recorded as imported
                 continue;
             }
 
@@ -432,15 +530,19 @@ public class WorldImporter implements IDataImporter {
                         Logger.error("Declared size of chunk is negative");
                     } else {
                         var data = new MemoryBuffer(n).cpyFrom(base + 5);
+                        task.pending.incrementAndGet();
                         this.jobQueue.add(()-> {
                             if (!this.isRunning) {
                                 data.free();
+                                task.incomplete = true;
+                                task.release();
                                 return;
                             }
                             try {
                                 this.importChunk(b, data, x, z);
                             } finally {
                                 data.free();
+                                task.release();
                             }
                         });
                         this.totalChunks.incrementAndGet();
@@ -449,6 +551,45 @@ public class WorldImporter implements IDataImporter {
                     }
                 }
             }
+        }
+    }
+
+    //Records the regions that finished a while ago (so their sections had the time to be saved) as imported
+    private void commitProgress() {
+        var progress = this.options.progress();
+        long now = System.nanoTime();
+        if (progress == null || now - this.lastProgressCommit < PROGRESS_COMMIT_INTERVAL_NANOS) {
+            return;
+        }
+        this.lastProgressCommit = now;
+        progress.commit(false, this.world.storage::flush);
+    }
+
+    //Called by the worker when the import ends, completed is true if every region was processed
+    private void finishProgress(boolean completed) {
+        var progress = this.options.progress();
+        if (progress == null) {
+            return;
+        }
+        if (completed) {
+            //Give the sections of the last regions the time to be saved before recording them
+            long deadline = System.nanoTime() + 120_000_000_000L;
+            while (this.pendingSaves.getAsInt() != 0 && System.nanoTime() < deadline && this.isRunning) {
+                try {
+                    Thread.sleep(100);
+                } catch (InterruptedException e) {
+                    break;
+                }
+            }
+        }
+        progress.commit(completed, this.world.storage::flush);
+        progress.close();
+    }
+
+    private void closeProgress() {
+        var progress = this.options.progress();
+        if (progress != null) {
+            progress.close();
         }
     }
 
@@ -766,7 +907,14 @@ public class WorldImporter implements IDataImporter {
 
     @Override
     public String getCompletionDetails() {
+        var details = new ArrayList<String>();
+        if (this.skippedRegions != 0) {
+            details.add(this.skippedRegions + " unchanged regions were already imported and skipped");
+        }
         int failed = this.failedChunks.get();
-        return failed == 0 ? null : failed + " chunks could not be read and were skipped (see log)";
+        if (failed != 0) {
+            details.add(failed + " chunks could not be read and were skipped (see log)");
+        }
+        return details.isEmpty() ? null : String.join(", ", details);
     }
 }

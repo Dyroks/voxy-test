@@ -1,6 +1,7 @@
 package me.cortex.voxy.client;
 
 import com.mojang.brigadier.arguments.BoolArgumentType;
+import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.mojang.brigadier.context.CommandContext;
@@ -8,9 +9,12 @@ import com.mojang.brigadier.suggestion.Suggestions;
 import com.mojang.brigadier.suggestion.SuggestionsBuilder;
 import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
 import me.cortex.voxy.common.DebugUtils;
+import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.commonImpl.VoxyCommon;
 import me.cortex.voxy.commonImpl.WorldIdentifier;
 import me.cortex.voxy.commonImpl.importers.DHImporter;
+import me.cortex.voxy.commonImpl.importers.ImportOptions;
+import me.cortex.voxy.commonImpl.importers.ImportProgress;
 import me.cortex.voxy.commonImpl.importers.WorldImporter;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommands;
 import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
@@ -31,25 +35,36 @@ import java.util.concurrent.CompletableFuture;
 public class VoxyCommands {
 
     public static LiteralArgumentBuilder<FabricClientCommandSource> register() {
+        //The optional radius (in blocks around the player) limits the import to the chunks within it
         var imports = ClientCommands.literal("import")
                 .then(ClientCommands.literal("world")
                         .then(ClientCommands.argument("world_name", StringArgumentType.string())
                                 .suggests(VoxyCommands::importWorldSuggester)
-                                .executes(VoxyCommands::importWorld)))
+                                .executes(ctx->importWorld(ctx, 0))
+                                .then(ClientCommands.argument("radius", IntegerArgumentType.integer(1))
+                                        .executes(ctx->importWorld(ctx, IntegerArgumentType.getInteger(ctx, "radius"))))))
                 .then(ClientCommands.literal("bobby")
                         .then(ClientCommands.argument("world_name", StringArgumentType.string())
                                 .suggests(VoxyCommands::importBobbySuggester)
-                                .executes(VoxyCommands::importBobby)))
+                                .executes(ctx->importBobby(ctx, 0))
+                                .then(ClientCommands.argument("radius", IntegerArgumentType.integer(1))
+                                        .executes(ctx->importBobby(ctx, IntegerArgumentType.getInteger(ctx, "radius"))))))
                 .then(ClientCommands.literal("raw")
                         .then(ClientCommands.argument("path", StringArgumentType.string())
-                                .executes(VoxyCommands::importRaw)))
+                                .executes(ctx->importRaw(ctx, 0))
+                                .then(ClientCommands.argument("radius", IntegerArgumentType.integer(1))
+                                        .executes(ctx->importRaw(ctx, IntegerArgumentType.getInteger(ctx, "radius"))))))
                 .then(ClientCommands.literal("zip")
                         .then(ClientCommands.argument("zipPath", StringArgumentType.string())
                                 .executes(VoxyCommands::importZip)
                                 .then(ClientCommands.argument("innerPath", StringArgumentType.string())
                                         .executes(VoxyCommands::importZip))))
                 .then(ClientCommands.literal("current")
-                        .executes(VoxyCommands::importCurrentWorldIn))
+                        .executes(ctx->importCurrentWorldIn(ctx, 0))
+                        .then(ClientCommands.argument("radius", IntegerArgumentType.integer(1))
+                                .executes(ctx->importCurrentWorldIn(ctx, IntegerArgumentType.getInteger(ctx, "radius")))))
+                .then(ClientCommands.literal("reset_progress")
+                        .executes(VoxyCommands::resetImportProgress))
                 .then(ClientCommands.literal("cancel")
                         .executes(VoxyCommands::cancelImport));
 
@@ -137,7 +152,7 @@ public class VoxyCommands {
                 new DHImporter(dbFile_, engine, Minecraft.getInstance().level, instance.getServiceManager(), instance.savingServiceRateLimiter))?0:1;
     }
 
-    private static boolean fileBasedImporter(File directory) {
+    private static boolean fileBasedImporter(File directory, int radius) {
         var instance = (VoxyClientInstance)VoxyCommon.getInstance();
         if (instance == null) {
             return false;
@@ -147,28 +162,93 @@ public class VoxyCommands {
         if (engine==null) return false;
         return instance.getImportManager().makeAndRunIfNone(engine, ()->{
             var importer = new WorldImporter(engine, Minecraft.getInstance().level, instance.getServiceManager(), instance.savingServiceRateLimiter, instance::getPendingSaveCount);
-            importer.importRegionDirectoryAsync(directory);
+            importer.importRegionDirectoryAsync(directory, createImportOptions(radius, openImportProgress(instance, directory)));
             return importer;
         });
     }
 
-    private static int importRaw(CommandContext<FabricClientCommandSource> ctx) {
+    //Imports around the player (closest regions first), optionally limited to a radius in blocks
+    private static ImportOptions createImportOptions(int radius, ImportProgress progress) {
+        var player = Minecraft.getInstance().player;
+        if (player == null) {
+            return new ImportOptions(false, 0, 0, 0, progress);
+        }
+        return new ImportOptions(true, player.getX(), player.getZ(), radius, progress);
+    }
+
+    private static Path getImportProgressDirectory(VoxyClientInstance instance) {
+        var identifier = WorldIdentifier.of(Minecraft.getInstance().level);
+        if (identifier == null) {
+            return null;
+        }
+        return instance.getStorageBasePath().resolve(identifier.getWorldId()).resolve("import_progress");
+    }
+
+    //Opens the progress of importing the region directory into the current world, so the import can be resumed
+    private static ImportProgress openImportProgress(VoxyClientInstance instance, File regionDirectory) {
+        try {
+            var directory = getImportProgressDirectory(instance);
+            if (directory == null) {
+                return null;
+            }
+            String source = regionDirectory.getCanonicalPath();
+            //The storage identity changes if the voxy storage of the world is deleted, the progress is then discarded
+            var identityFile = directory.getParent().resolve("storage").resolve("IDENTITY");
+            String identity = Files.isRegularFile(identityFile) ? Files.readString(identityFile).trim() : "unknown";
+            var progress = ImportProgress.open(directory.resolve(ImportProgress.fileNameFor(source)), source, identity);
+            if (progress.getCompletedCount() != 0) {
+                Logger.info("Resuming voxy import of " + source + ", " + progress.getCompletedCount() + " regions were already imported");
+            }
+            return progress;
+        } catch (Exception e) {
+            Logger.error("Could not open the voxy import progress, the import will not be resumable", e);
+            return null;
+        }
+    }
+
+    private static int resetImportProgress(CommandContext<FabricClientCommandSource> ctx) {
+        var instance = (VoxyClientInstance)VoxyCommon.getInstance();
+        if (instance == null) {
+            ctx.getSource().sendError(Component.translatable("Voxy must be enabled in settings to use this"));
+            return 1;
+        }
+        var engine = WorldIdentifier.ofEngineNullable(Minecraft.getInstance().level);
+        if (engine != null && instance.getImportManager().isImportRunning(engine)) {
+            ctx.getSource().sendError(Component.literal("An import is running in this world, cancel it first with /voxy import cancel"));
+            return 1;
+        }
+        var directory = getImportProgressDirectory(instance);
+        if (directory == null) {
+            return 1;
+        }
+        try {
+            int removed = ImportProgress.reset(directory);
+            ctx.getSource().sendFeedback(Component.literal("Cleared the voxy import progress of this world (" + removed + " file(s)), the next import will process every region again"));
+            return 0;
+        } catch (IOException e) {
+            Logger.error("Failed to reset the voxy import progress", e);
+            ctx.getSource().sendError(Component.literal("Failed to reset the import progress: " + e.getMessage()));
+            return 1;
+        }
+    }
+
+    private static int importRaw(CommandContext<FabricClientCommandSource> ctx, int radius) {
         if (VoxyCommon.getInstance() == null) {
             ctx.getSource().sendError(Component.translatable("Voxy must be enabled in settings to use this"));
             return 1;
         }
 
-        return fileBasedImporter(new File(ctx.getArgument("path", String.class)))?0:1;
+        return fileBasedImporter(new File(ctx.getArgument("path", String.class)), radius)?0:1;
     }
 
-    private static int importBobby(CommandContext<FabricClientCommandSource> ctx) {
+    private static int importBobby(CommandContext<FabricClientCommandSource> ctx, int radius) {
         if (VoxyCommon.getInstance() == null) {
             ctx.getSource().sendError(Component.translatable("Voxy must be enabled in settings to use this"));
             return 1;
         }
 
         var file = new File(".bobby").toPath().resolve(ctx.getArgument("world_name", String.class)).toFile();
-        return fileBasedImporter(file)?0:1;
+        return fileBasedImporter(file, radius)?0:1;
     }
 
     private static CompletableFuture<Suggestions> importWorldSuggester(CommandContext<FabricClientCommandSource> ctx, SuggestionsBuilder sb) {
@@ -221,7 +301,7 @@ public class VoxyCommands {
     }
 
 
-    private static int importCurrentWorldIn(CommandContext<FabricClientCommandSource> ctx) {
+    private static int importCurrentWorldIn(CommandContext<FabricClientCommandSource> ctx, int radius) {
         if (VoxyCommon.getInstance() == null) {
             ctx.getSource().sendError(Component.translatable("Voxy must be enabled in settings to use this"));
             return 1;
@@ -237,10 +317,10 @@ public class VoxyCommands {
             ctx.getSource().sendError(Component.translatable("Cannot find region folder for current dimension"));
             return 1;
         }
-        return fileBasedImporter(regionPath.toFile())?0:1;
+        return fileBasedImporter(regionPath.toFile(), radius)?0:1;
     }
 
-    private static int importWorld(CommandContext<FabricClientCommandSource> ctx) {
+    private static int importWorld(CommandContext<FabricClientCommandSource> ctx, int radius) {
         if (VoxyCommon.getInstance() == null) {
             ctx.getSource().sendError(Component.translatable("Voxy must be enabled in settings to use this"));
             return 1;
@@ -257,7 +337,7 @@ public class VoxyCommands {
                     .resolve("region")
                     .toFile();
             if (!dimFile.isDirectory()) return 1;
-            return fileBasedImporter(dimFile)?0:1;
+            return fileBasedImporter(dimFile, radius)?0:1;
             //We are in a world directory, so import the current dimension we are in
             /*
             for (var dim : new String[]{"overworld", "the_nether", "the_end"}) {//This is so annoying that you cant loop through all the dimensions
@@ -275,7 +355,7 @@ public class VoxyCommands {
             if (!(name.endsWith("region"))) {
                 file = file.resolve("region");
             }
-            return fileBasedImporter(file.toFile()) ? 0 : 1;
+            return fileBasedImporter(file.toFile(), radius) ? 0 : 1;
         }
     }
 
@@ -297,7 +377,7 @@ public class VoxyCommands {
         if (engine != null) {
             return instance.getImportManager().makeAndRunIfNone(engine, () -> {
                 var importer = new WorldImporter(engine, Minecraft.getInstance().level, instance.getServiceManager(), instance.savingServiceRateLimiter, instance::getPendingSaveCount);
-                importer.importZippedRegionDirectoryAsync(zip, finalInnerDir);
+                importer.importZippedRegionDirectoryAsync(zip, finalInnerDir, createImportOptions(0, null));
                 return importer;
             }) ? 0 : 1;
         }

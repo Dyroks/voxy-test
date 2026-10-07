@@ -3,6 +3,8 @@ package me.cortex.voxy.common.voxelization;
 import me.cortex.voxy.common.world.other.Mapper;
 import me.cortex.voxy.common.world.other.Mipper;
 
+import java.util.Arrays;
+
 public class WorldVoxilizedSectionMipper {
     private static int G(int x, int y, int z) {
         return ((y<<8)|(z<<4)|x);
@@ -22,6 +24,21 @@ public class WorldVoxilizedSectionMipper {
 
     public static void mipSection(VoxelizedSection section, Mapper mapper) {
         var data = section.section;
+
+        //A uniform section (e.g. air above the terrain or solid stone) mips to the same value at every level
+        // since mipping 8 identical values returns that value, so skip all the mip calls
+        long first = data[0];
+        boolean uniform = true;
+        for (int j = 1; j < 16*16*16; j++) {
+            if (data[j] != first) {
+                uniform = false;
+                break;
+            }
+        }
+        if (uniform) {
+            Arrays.fill(data, 16*16*16, 16*16*16 + 8*8*8 + 4*4*4 + 2*2*2 + 1, first);
+            return;
+        }
 
         //Mip L1
         int i = 0;

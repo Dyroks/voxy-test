@@ -17,6 +17,11 @@ public class Mipper {
     public static long mip(long I000, long I100, long I001, long I101,
                            long I010, long I110, long I011, long I111,
                           Mapper mapper) {
+        //8 identical values always mip to that value (same opacity in the solid case, same light average in the air case)
+        if (I000 == I100 && I000 == I001 && I000 == I101 && I000 == I010 && I000 == I110 && I000 == I011 && I000 == I111) {
+            return I000;
+        }
+
         //TODO: do a stable sort on all the entires, w.r.t the opacity and maybe light as a secondary???
         // then select the highest value
         // UPDATE, dumbass, the highest value _is_ the max/min

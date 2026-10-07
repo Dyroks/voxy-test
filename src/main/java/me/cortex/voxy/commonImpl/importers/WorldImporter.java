@@ -13,6 +13,8 @@ import me.cortex.voxy.common.voxelization.WorldVoxilizedSectionMipper;
 import me.cortex.voxy.common.world.WorldEngine;
 import me.cortex.voxy.common.world.WorldUpdater;
 import me.cortex.voxy.common.world.service.SectionSavingService;
+import me.cortex.voxy.commonImpl.VoxyCommon;
+import it.unimi.dsi.fastutil.io.FastByteArrayInputStream;
 import net.minecraft.core.Holder;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
@@ -31,6 +33,7 @@ import org.apache.commons.compress.archivers.zip.ZipFile;
 import org.lwjgl.system.MemoryUtil;
 
 import java.io.DataInputStream;
+import java.io.EOFException;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
@@ -48,9 +51,17 @@ import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.function.IntSupplier;
 import java.util.function.Predicate;
+import java.util.zip.DataFormatException;
+import java.util.zip.Inflater;
 
 public class WorldImporter implements IDataImporter {
     private static final long STATS_INTERVAL_NANOS = 30_000_000_000L;
+    //Decodes every section with both the fast and the vanilla path and reports any difference (for testing)
+    private static final boolean VERIFY_FAST_DECODE = VoxyCommon.isVerificationFlagOn("verifyImportDecode");
+
+    //Region file chunk compression types
+    private static final byte COMPRESSION_ZLIB = 2;
+    private static final byte COMPRESSION_NONE = 3;
 
     //Result of importing a single chunk, every chunk must end in exactly one of these so that the import can complete
     private static final int CHUNK_IMPORTED = 0;
@@ -61,6 +72,7 @@ public class WorldImporter implements IDataImporter {
     private final PalettedContainerRO<Holder<Biome>> defaultBiomeProvider;
     private final Codec<PalettedContainerRO<Holder<Biome>>> biomeCodec;
     private final Codec<PalettedContainer<BlockState>> blockStateCodec;
+    private final FastSectionDecoder fastDecoder;
     private final IntSupplier pendingSaves;
     private final AtomicInteger estimatedTotalChunks = new AtomicInteger();//Slowly converges to the true value
     private final AtomicInteger totalChunks = new AtomicInteger();
@@ -72,6 +84,9 @@ public class WorldImporter implements IDataImporter {
     private final LongAdder nbtNanos = new LongAdder();
     private final LongAdder decodeNanos = new LongAdder();
     private final LongAdder insertNanos = new LongAdder();
+    private final LongAdder fastSections = new LongAdder();
+    private final LongAdder vanillaSections = new LongAdder();
+    private final AtomicInteger verifyMismatches = new AtomicInteger();
     private long statsStartTime;
     private long lastStatsTime;
     private long lastStatsProcessed;
@@ -154,6 +169,7 @@ public class WorldImporter implements IDataImporter {
         var factory = PalettedContainerFactory.create(mcWorld.registryAccess());
         this.biomeCodec = factory.biomeContainerCodec();
         this.blockStateCodec = factory.blockStatesContainerCodec();
+        this.fastDecoder = new FastSectionDecoder(this.world.getMapper(), biomeRegistry, defaultBiome);
     }
 
 
@@ -457,7 +473,54 @@ public class WorldImporter implements IDataImporter {
         };
     }
 
+    private static final int INITIAL_INFLATE_BUFFER_SIZE = 256*1024;
+    private static final int MAX_RETAINED_INFLATE_BUFFER_SIZE = 8*1024*1024;
+    private static final ThreadLocal<Inflater> INFLATER = ThreadLocal.withInitial(Inflater::new);
+    private static final ThreadLocal<byte[][]> INFLATE_BUFFER = ThreadLocal.withInitial(()->new byte[][]{new byte[INITIAL_INFLATE_BUFFER_SIZE]});
+
+    //Inflates a whole zlib chunk stream at once (reading straight from native memory) into a reused per thread buffer
+    // the returned stream is only valid until the next call on the same thread
+    private static DataInputStream inflate(MemoryBuffer stream) throws IOException {
+        var inflater = INFLATER.get();
+        var bufferHolder = INFLATE_BUFFER.get();
+        byte[] buffer = bufferHolder[0];
+        int length = 0;
+        int stalls = 0;
+        inflater.reset();
+        try {
+            inflater.setInput(MemoryUtil.memByteBuffer(stream.address, (int) stream.size));
+            while (!inflater.finished()) {
+                if (length == buffer.length) {
+                    buffer = Arrays.copyOf(buffer, buffer.length*2);
+                }
+                int inflated = inflater.inflate(buffer, length, buffer.length - length);
+                if (inflated == 0 && !inflater.finished()) {
+                    if (inflater.needsInput() || inflater.needsDictionary() || ++stalls > 16) {
+                        throw new EOFException("Truncated or invalid zlib chunk stream");
+                    }
+                }
+                length += inflated;
+            }
+        } catch (DataFormatException e) {
+            throw new IOException("Invalid zlib chunk stream", e);
+        } finally {
+            inflater.reset();//Drop the reference to the native input buffer
+        }
+        if (buffer.length <= MAX_RETAINED_INFLATE_BUFFER_SIZE) {
+            bufferHolder[0] = buffer;
+        }
+        return new DataInputStream(new FastByteArrayInputStream(buffer, 0, length));
+    }
+
     private DataInputStream decompress(byte flags, MemoryBuffer stream) throws IOException {
+        if (flags == COMPRESSION_ZLIB) {//The default, decompressed directly
+            return inflate(stream);
+        }
+        if (flags == COMPRESSION_NONE) {
+            byte[] raw = new byte[(int) stream.size];
+            UnsafeUtil.memcpy(stream.address, raw.length, raw);
+            return new DataInputStream(new FastByteArrayInputStream(raw));
+        }
         RegionFileVersion chunkStreamVersion = RegionFileVersion.fromId(flags);
         if (chunkStreamVersion == null) {
             Logger.error("Chunk has invalid chunk stream version");
@@ -543,7 +606,17 @@ public class WorldImporter implements IDataImporter {
             return;
         }
         long start = System.nanoTime();
-        VoxelizedSection csec = this.legacyDecodeSection(section, SECTION_CACHE.get().setPosition(x, y, z));
+        VoxelizedSection csec = SECTION_CACHE.get().setPosition(x, y, z);
+        if (this.fastDecoder.decode(section, csec)) {
+            this.fastSections.increment();
+            if (VERIFY_FAST_DECODE) {
+                this.verifyFastDecode(section, csec);
+            }
+        } else {
+            //Unusual section, use the vanilla codecs which keep the previous behaviour exactly
+            this.vanillaSections.increment();
+            csec = this.legacyDecodeSection(section, csec);
+        }
         long decoded = System.nanoTime();
         this.decodeNanos.add(decoded - start);
         if (csec == null) {
@@ -604,6 +677,39 @@ public class WorldImporter implements IDataImporter {
         );
     }
 
+    private static final ThreadLocal<VoxelizedSection> VERIFY_CACHE = ThreadLocal.withInitial(VoxelizedSection::createEmpty);
+    private void verifyFastDecode(CompoundTag section, VoxelizedSection fast) {
+        VoxelizedSection expected;
+        try {
+            expected = this.legacyDecodeSection(section, VERIFY_CACHE.get().setPosition(fast.x, fast.y, fast.z));
+        } catch (Exception e) {
+            expected = null;
+        }
+        String problem = null;
+        if (expected == null) {
+            problem = "the vanilla path could not decode the section";
+        } else if (expected.lvl0NonAirCount != fast.lvl0NonAirCount) {
+            problem = "non air count " + fast.lvl0NonAirCount + " expected " + expected.lvl0NonAirCount;
+        } else {
+            for (int i = 0; i < 16*16*16; i++) {
+                if (expected.section[i] != fast.section[i]) {
+                    problem = "index " + i + " is " + Long.toHexString(fast.section[i]) + " expected " + Long.toHexString(expected.section[i]);
+                    break;
+                }
+            }
+        }
+        if (problem != null) {
+            int count = this.verifyMismatches.incrementAndGet();
+            if (count <= 20 || count%1000 == 0) {
+                String blockStates = section.getCompound("block_states").map(Object::toString).orElse("none");
+                if (blockStates.length() > 2000) {
+                    blockStates = blockStates.substring(0, 2000) + "...";
+                }
+                Logger.error("Fast import decode mismatch #" + count + " at section " + fast.x + ", " + fast.y + ", " + fast.z + ": " + problem + ", block states: " + blockStates);
+            }
+        }
+    }
+
     private void logStatistics(boolean force) {
         long now = System.nanoTime();
         if ((!force) && now - this.lastStatsTime < STATS_INTERVAL_NANOS) {
@@ -624,6 +730,12 @@ public class WorldImporter implements IDataImporter {
                 .append(", nbt ").append(perChunkMs(this.nbtNanos.sum(), chunks))
                 .append(", decode ").append(perChunkMs(this.decodeNanos.sum(), chunks))
                 .append(", mip+insert ").append(perChunkMs(this.insertNanos.sum(), chunks));
+        long fast = this.fastSections.sum();
+        long vanilla = this.vanillaSections.sum();
+        sb.append(" | sections: ").append(fast).append(" fast, ").append(vanilla).append(" vanilla fallback");
+        if (VERIFY_FAST_DECODE) {
+            sb.append(", ").append(this.verifyMismatches.get()).append(" verification mismatches");
+        }
         sb.append(" | saves: ").append((long) (deltaSaves/intervalSeconds)).append("/s, ")
                 .append(deltaSaves==0?"-":perChunkMs(saveNanos - this.lastStatsSaveNanos, deltaSaves)).append("ms each, ")
                 .append(this.pendingSaves.getAsInt()).append(" queued");

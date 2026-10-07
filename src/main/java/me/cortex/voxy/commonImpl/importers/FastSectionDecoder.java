@@ -5,7 +5,9 @@ import me.cortex.voxy.common.world.other.Mapper;
 import net.minecraft.core.Holder;
 import net.minecraft.core.Registry;
 import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.LongArrayTag;
 import net.minecraft.nbt.NbtOps;
+import net.minecraft.nbt.StringTag;
 import net.minecraft.nbt.Tag;
 import net.minecraft.resources.Identifier;
 import net.minecraft.world.level.biome.Biome;
@@ -95,7 +97,7 @@ final class FastSectionDecoder {
         if (paletteSize != 1) {
             //Same storage size as the vanilla serializer, 4 bits minimum (linear palette) then the exact bit count
             bits = Math.max(4, ceilLog2(paletteSize));
-            data = blockStates.getLongArray("data").orElse(null);
+            data = getLongArray(blockStates, "data");
             if (data == null || data.length != packedLength(16*16*16, bits)) {
                 return false;
             }
@@ -147,11 +149,10 @@ final class FastSectionDecoder {
             return false;
         }
         for (int i = 0; i < paletteSize; i++) {
-            var name = palette.getString(i).orElse(null);
-            if (name == null) {
+            if (!(palette.get(i) instanceof StringTag name)) {
                 return false;
             }
-            int id = this.getBiomeId(name);
+            int id = this.getBiomeId(name.value());
             if (id == UNRESOLVED) {
                 return false;
             }
@@ -164,7 +165,7 @@ final class FastSectionDecoder {
         }
 
         int bits = ceilLog2(paletteSize);
-        long[] data = biomeData.getLongArray("data").orElse(null);
+        long[] data = getLongArray(biomeData, "data");
         if (data == null || data.length != packedLength(4*4*4, bits)) {
             return false;
         }
@@ -178,6 +179,10 @@ final class FastSectionDecoder {
             biomes[i] = biomePalette[index];
         }
         return true;
+    }
+
+    private static long[] getLongArray(CompoundTag tag, String key) {
+        return tag.get(key) instanceof LongArrayTag array ? array.getAsLongArray() : null;
     }
 
     private static byte getLight(byte[] blockLight, byte[] skyLight, int index) {

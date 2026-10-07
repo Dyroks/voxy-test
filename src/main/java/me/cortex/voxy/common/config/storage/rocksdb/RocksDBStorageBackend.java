@@ -225,14 +225,24 @@ public class RocksDBStorageBackend extends StorageBackend {
 
     @Override
     public void addStatistics(List<String> out) {
+        //num-files-at-level is a string property, the others are integer properties
+        String l0Files;
         try {
-            long l0Files = this.db.getLongProperty(this.worldSections, "rocksdb.num-files-at-level0");
-            long pendingCompaction = this.db.getLongProperty(this.worldSections, "rocksdb.estimate-pending-compaction-bytes");
-            long delayedWriteRate = this.db.getLongProperty("rocksdb.actual-delayed-write-rate");
-            long writeStopped = this.db.getLongProperty("rocksdb.is-write-stopped");
-            out.add("rocksdb L0 files: " + l0Files + ", pending compaction: " + (pendingCompaction>>20) + "MB, delayed write rate: " + delayedWriteRate + ", write stopped: " + writeStopped);
+            l0Files = this.db.getProperty(this.worldSections, "rocksdb.num-files-at-level0").trim();
         } catch (RocksDBException e) {
-            out.add("rocksdb stats unavailable: " + e.getMessage());
+            l0Files = "?";
+        }
+        out.add("rocksdb L0 files: " + l0Files
+                + ", pending compaction: " + this.getLongPropertyOr(this.worldSections, "rocksdb.estimate-pending-compaction-bytes", -(1L<<20))/(1L<<20) + "MB"
+                + ", delayed write rate: " + this.getLongPropertyOr(null, "rocksdb.actual-delayed-write-rate", -1)
+                + ", write stopped: " + this.getLongPropertyOr(null, "rocksdb.is-write-stopped", -1));
+    }
+
+    private long getLongPropertyOr(ColumnFamilyHandle family, String property, long fallback) {
+        try {
+            return family == null ? this.db.getLongProperty(property) : this.db.getLongProperty(family, property);
+        } catch (RocksDBException e) {
+            return fallback;
         }
     }
 

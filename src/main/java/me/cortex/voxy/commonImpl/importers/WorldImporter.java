@@ -88,6 +88,7 @@ public class WorldImporter implements IDataImporter {
     private final LongAdder insertNanos = new LongAdder();
     private final LongAdder fastSections = new LongAdder();
     private final LongAdder vanillaSections = new LongAdder();
+    private final LongAdder sectionsWithBlocks = new LongAdder();
     private final AtomicInteger verifyMismatches = new AtomicInteger();
     private long statsStartTime;
     private long lastStatsTime;
@@ -176,7 +177,7 @@ public class WorldImporter implements IDataImporter {
         var factory = PalettedContainerFactory.create(mcWorld.registryAccess());
         this.biomeCodec = factory.biomeContainerCodec();
         this.blockStateCodec = factory.blockStatesContainerCodec();
-        this.fastDecoder = new FastSectionDecoder(this.world.getMapper(), biomeRegistry, defaultBiome);
+        this.fastDecoder = new FastSectionDecoder(this.world.getMapper(), this.blockStateCodec, this.biomeCodec, defaultBiome);
     }
 
 
@@ -767,6 +768,9 @@ public class WorldImporter implements IDataImporter {
         if (csec == null) {
             return;
         }
+        if (csec.lvl0NonAirCount != 0) {
+            this.sectionsWithBlocks.increment();
+        }
 
         WorldVoxilizedSectionMipper.mipSection(csec, this.world.getMapper());
         WorldUpdater.insertUpdate(this.world, csec);
@@ -878,6 +882,15 @@ public class WorldImporter implements IDataImporter {
         long fast = this.fastSections.sum();
         long vanilla = this.vanillaSections.sum();
         sb.append(" | sections: ").append(fast).append(" fast, ").append(vanilla).append(" vanilla fallback");
+        var fallbackReasons = this.fastDecoder.getFallbackSummary();
+        if (fallbackReasons != null) {
+            sb.append(" (").append(fallbackReasons).append(")");
+        }
+        sb.append(", ").append(this.sectionsWithBlocks.sum()).append(" containing blocks");
+        long partialBlockStates = this.fastDecoder.getPartialBlockStateCount();
+        if (partialBlockStates != 0) {
+            sb.append(", ").append(partialBlockStates).append(" block states only partially decoded (see log)");
+        }
         if (VERIFY_FAST_DECODE) {
             sb.append(", ").append(this.verifyMismatches.get()).append(" verification mismatches");
         }

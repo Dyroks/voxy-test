@@ -45,6 +45,8 @@ import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -75,11 +77,16 @@ public class WorldImporter implements IDataImporter {
     private final Codec<PalettedContainerRO<Holder<Biome>>> biomeCodec;
     private final Codec<PalettedContainer<BlockState>> blockStateCodec;
     private final FastSectionDecoder fastDecoder;
+    private final PaletteUpgrader paletteUpgrader = new PaletteUpgrader();
+    private final Set<Integer> loggedDataVersions = ConcurrentHashMap.newKeySet();
     private final IntSupplier pendingSaves;
     private final AtomicInteger estimatedTotalChunks = new AtomicInteger();//Slowly converges to the true value
     private final AtomicInteger totalChunks = new AtomicInteger();
     private final AtomicInteger chunksProcessed = new AtomicInteger();
     private final AtomicInteger failedChunks = new AtomicInteger();
+    private final LongAdder upgradedChunks = new LongAdder();
+    private final LongAdder unlitChunks = new LongAdder();
+    private final AtomicBoolean loggedUnlitChunks = new AtomicBoolean();
 
     //Cumulative time (in nanoseconds, summed over all threads) spent in each stage of the import
     private final LongAdder decompressNanos = new LongAdder();
@@ -734,10 +741,31 @@ public class WorldImporter implements IDataImporter {
                 Logger.error("Chunk position is not located in correct region, expected: (" + regionX + ", " + regionZ+"), got: " + "(" + (x>>5) + ", " + (z>>5)+"), importing anyway");
             }
 
+            //Chunks saved by an older version are only upgraded by the game when it loads them, the importer must do it
+            // itself or the palette entries in an older format (e.g. block states before 26.3) are not understood
+            int dataVersion = chunk.getIntOr("DataVersion", -1);
+            int upgradeFrom = 0;
+            if (PaletteUpgrader.needsUpgrade(dataVersion)) {
+                upgradeFrom = dataVersion;
+                this.upgradedChunks.increment();
+                if (this.loggedDataVersions.add(dataVersion)) {
+                    Logger.info("Importing chunks saved with data version " + dataVersion + " (the game is " + PaletteUpgrader.CURRENT_DATA_VERSION + "), their block states and biomes are upgraded like the game does when loading them");
+                }
+            }
+
+            boolean hasLight = false;
             for (var sectionE : chunk.getList("sections").orElseThrow()) {
                 var section = (CompoundTag) sectionE;
+                hasLight |= section.contains("SkyLight") || section.contains("BlockLight");
                 int y = section.getIntOr("Y", Integer.MIN_VALUE);
-                this.importSectionNBT(x, y, z, section);
+                this.importSectionNBT(x, y, z, section, upgradeFrom);
+            }
+            //The game computes the light of such chunks when loading them, the importer can only use the stored light
+            if (!hasLight) {
+                this.unlitChunks.increment();
+                if (this.loggedUnlitChunks.compareAndSet(false, true)) {
+                    Logger.warn("Some chunks have no stored light data, they are imported unlit (dark) until the game loads them");
+                }
             }
         } catch (Exception e) {
             Logger.error("Exception importing world chunk:",e);
@@ -747,11 +775,16 @@ public class WorldImporter implements IDataImporter {
 
     private static final byte[] EMPTY = new byte[0];
     private static final ThreadLocal<VoxelizedSection> SECTION_CACHE = ThreadLocal.withInitial(VoxelizedSection::createEmpty);
-    private void importSectionNBT(int x, int y, int z, CompoundTag section) {
+    //upgradeFrom is the data version to upgrade the section palettes from, 0 if they are already in the current format
+    private void importSectionNBT(int x, int y, int z, CompoundTag section, int upgradeFrom) {
         if (section.getCompound("block_states").isEmpty()) {
             return;
         }
         long start = System.nanoTime();
+        if (upgradeFrom != 0) {
+            //Done before choosing the decoder so that both see the same palettes
+            this.paletteUpgrader.upgradeSection(section, upgradeFrom);
+        }
         VoxelizedSection csec = SECTION_CACHE.get().setPosition(x, y, z);
         if (this.fastDecoder.decode(section, csec)) {
             this.fastSections.increment();
@@ -874,7 +907,12 @@ public class WorldImporter implements IDataImporter {
 
         var sb = new StringBuilder("Voxy import stats: ");
         sb.append(processed).append(" chunks imported (").append((long) ((processed - this.lastStatsProcessed)/intervalSeconds)).append("/s now, ")
-                .append((long) (processed/totalSeconds)).append("/s average), ").append(this.failedChunks.get()).append(" failed");
+                .append((long) (processed/totalSeconds)).append("/s average), ").append(this.failedChunks.get()).append(" failed, ")
+                .append(this.upgradedChunks.sum()).append(" upgraded from an older version");
+        long unlit = this.unlitChunks.sum();
+        if (unlit != 0) {
+            sb.append(", ").append(unlit).append(" without light data");
+        }
         sb.append(" | cpu ms per chunk: decompress ").append(perChunkMs(this.decompressNanos.sum(), chunks))
                 .append(", nbt ").append(perChunkMs(this.nbtNanos.sum(), chunks))
                 .append(", decode ").append(perChunkMs(this.decodeNanos.sum(), chunks))
